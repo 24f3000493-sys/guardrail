@@ -1,5 +1,4 @@
 import os
-import urllib.parse
 import socket
 import ipaddress
 import httpx
@@ -55,38 +54,46 @@ async def guardrail(request: Request, path: str):
         try:
             async with httpx.AsyncClient(follow_redirects=False) as client:
                 for _ in range(5):
-                    parsed = urllib.parse.urlparse(current_url)
+                    # 🛡️ FIX 3: Use httpx's internal URL parser to perfectly match the client
+                    try:
+                        u = httpx.URL(current_url)
+                    except Exception:
+                        return {"action": "block", "reason": "Malformed URL", "result": None}
                     
-                    if parsed.scheme not in ["http", "https"]:
+                    if u.scheme not in ["http", "https"]:
                         return {"action": "block", "reason": "Must use HTTP or HTTPS", "result": None}
                     
-                    if parsed.hostname not in ALLOWED_HOSTS:
+                    if u.host not in ALLOWED_HOSTS:
                         return {"action": "block", "reason": "Host not allowed", "result": None}
                     
-                    # 🛡️ THE NEW FIX: Block Userinfo confusion
-                    if parsed.username or parsed.password or "@" in parsed.netloc:
+                    if u.username or u.password:
                         return {"action": "block", "reason": "Userinfo tricks blocked", "result": None}
                         
-                    # 🛡️ THE NEW FIX: DNS Resolution Check
-                    try:
-                        # Find out exactly what IP this website really points to
-                        ip_string = socket.gethostbyname(parsed.hostname)
-                        ip_obj = ipaddress.ip_address(ip_string)
+                    # 🛡️ FIX 2: Block SSRF Port Scanning attempts
+                    if u.port and u.port not in [80, 443]:
+                        return {"action": "block", "reason": "Port scanning blocked", "result": None}
                         
-                        # Block if it secretly points to a private, loopback, or metadata IP
-                        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast:
-                            return {"action": "block", "reason": "DNS points to internal IP", "result": None}
+                    # 🛡️ FIX 1: Strict DNS check handling both IPv4 and IPv6
+                    try:
+                        addr_info = socket.getaddrinfo(u.host, None)
+                        for result in addr_info:
+                            ip_string = result[4][0]
+                            ip_obj = ipaddress.ip_address(ip_string)
+                            # is_reserved and is_unspecified catch sneaky Edge-case IPs
+                            if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_reserved or ip_obj.is_unspecified:
+                                return {"action": "block", "reason": "DNS points to internal IP", "result": None}
                     except Exception:
                         return {"action": "block", "reason": "DNS resolution failed", "result": None}
 
-                    # Fetch the URL now that it is proven 100% safe
-                    resp = await client.get(current_url, timeout=5.0)
+                    # By passing `u` directly, we guarantee zero parsing differentials!
+                    resp = await client.get(u, timeout=5.0)
                     
                     if 300 <= resp.status_code < 400:
                         location = resp.headers.get("Location")
                         if not location:
                             break
-                        current_url = urllib.parse.urljoin(current_url, location)
+                        # Safely process redirects using the secure parser
+                        current_url = str(u.join(location))
                         continue
                     
                     return {"action": "allow", "reason": "Safe URL", "result": resp.text}
