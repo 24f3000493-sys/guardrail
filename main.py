@@ -1,4 +1,5 @@
 import os
+import re
 import socket
 import ipaddress
 import httpx
@@ -54,45 +55,39 @@ async def guardrail(request: Request, path: str):
         try:
             async with httpx.AsyncClient(follow_redirects=False) as client:
                 for _ in range(5):
-                    # 🛡️ FIX 3: Use httpx's internal URL parser to perfectly match the client
-                    try:
-                        u = httpx.URL(current_url)
-                    except Exception:
-                        return {"action": "block", "reason": "Malformed URL", "result": None}
-                    
-                    if u.scheme not in ["http", "https"]:
-                        return {"action": "block", "reason": "Must use HTTP or HTTPS", "result": None}
-                    
-                    if u.host not in ALLOWED_HOSTS:
-                        return {"action": "block", "reason": "Host not allowed", "result": None}
-                    
-                    if u.username or u.password:
-                        return {"action": "block", "reason": "Userinfo tricks blocked", "result": None}
+                    # 🛡️ 1. Absolute String Restrictions (Blocks CRLF and smuggling)
+                    if "\\" in current_url or re.search(r"[\s]", current_url):
+                        return {"action": "block", "reason": "Tricky characters blocked", "result": None}
+
+                    # 🛡️ 2. Strict Regex Prefix Validation
+                    # This completely defeats userinfo tricks (@), lookalike subdomains (.evil.com), 
+                    # and port scanning by enforcing exactly what characters can follow the hostname.
+                    regex_pattern = r"^https?://(example\.com|www\.iana\.org)(:(80|443))?(/|\?|#|$)"
+                    if not re.match(regex_pattern, current_url, re.IGNORECASE):
+                        return {"action": "block", "reason": "Strict URL pattern failed", "result": None}
+
+                    # Safe to parse now
+                    u = httpx.URL(current_url)
                         
-                    # 🛡️ FIX 2: Block SSRF Port Scanning attempts
-                    if u.port and u.port not in [80, 443]:
-                        return {"action": "block", "reason": "Port scanning blocked", "result": None}
-                        
-                    # 🛡️ FIX 1: Strict DNS check handling both IPv4 and IPv6
+                    # 🛡️ 3. Environment DNS spoofing check
                     try:
                         addr_info = socket.getaddrinfo(u.host, None)
                         for result in addr_info:
                             ip_string = result[4][0]
                             ip_obj = ipaddress.ip_address(ip_string)
-                            # is_reserved and is_unspecified catch sneaky Edge-case IPs
                             if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_multicast or ip_obj.is_reserved or ip_obj.is_unspecified:
                                 return {"action": "block", "reason": "DNS points to internal IP", "result": None}
                     except Exception:
                         return {"action": "block", "reason": "DNS resolution failed", "result": None}
 
-                    # By passing `u` directly, we guarantee zero parsing differentials!
+                    # Fetch the URL securely
                     resp = await client.get(u, timeout=5.0)
                     
                     if 300 <= resp.status_code < 400:
                         location = resp.headers.get("Location")
                         if not location:
                             break
-                        # Safely process redirects using the secure parser
+                        # Safely process redirects; the next loop iteration forces the regex check again!
                         current_url = str(u.join(location))
                         continue
                     
